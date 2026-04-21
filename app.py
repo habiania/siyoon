@@ -8,7 +8,8 @@ import re
 
 # --- [1. 설정 정보] ---
 GEMINI_API_KEY = "AIzaSyDPwqZCgMvsESnP5kg3C-ZDSIW3tt3xSYU" 
-DOME_KEY = "69e11616807b334323c19d1a80cfd491"
+DOME_ID = "sns@262783"  # 사장님 아이디
+DOME_KEY = "69e11616807b334323c19d1a80cfd491" # 사장님 인증키
 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
@@ -16,14 +17,17 @@ today_str = datetime.now().strftime("%Y-%m-%d")
 
 st.set_page_config(page_title="Gemini AI 시즌 소싱 마스터", layout="wide")
 
-# --- [2. 핵심 함수: 도매매 수집 (글자 깨짐 방지 추가)] ---
+# --- [2. 핵심 함수: 도매매 수집] ---
 def fetch_dome_data(keyword, limit=10):
     url = "http://openapi.domeggook.com/helper/api/itemList"
+    
+    # 도매매 API 가이드에 맞춘 파라미터 재설정
     params = {
         "ver": "2.0",
         "mode": "getItemList",
-        "aid": DOME_KEY,
-        "market": DOME_ID,  #
+        "aid": DOME_KEY,      # 인증키
+        "id": DOME_ID,        # 아이디 추가
+        "market": "dome",     # [중요] 변수가 아닌 문자열 "dome"으로 고정
         "sw": keyword,    
         "sz": limit,      
         "sort": "reg"     
@@ -32,20 +36,18 @@ def fetch_dome_data(keyword, limit=10):
     try:
         res = requests.get(url, params=params)
         
-        # [핵심 수정] 도매매 특유의 글자 인코딩(EUC-KR) 처리
-        # 만약 UTF-8로 읽어서 에러가 나면 EUC-KR로 읽도록 시도합니다.
+        # 글자 깨짐 방지 (EUC-KR 처리)
         try:
             content = res.content.decode('utf-8')
         except UnicodeDecodeError:
             content = res.content.decode('euc-kr', errors='replace')
         
-        # XML 해석
         root = ET.fromstring(content)
         
-        # 도매매 응답 메시지 확인
+        # 에러 메시지 확인
         msg_node = root.find(".//message")
         if msg_node is not None and msg_node.text != "OK":
-            st.error(f"도매매 응답: {msg_node.text}")
+            st.warning(f"도매매 알림: {msg_node.text}")
             return pd.DataFrame()
 
         items = []
@@ -61,34 +63,26 @@ def fetch_dome_data(keyword, limit=10):
                 
         return pd.DataFrame(items)
     except Exception as e:
-        st.error(f"데이터 처리 중 오류: {e}")
+        st.error(f"연결 오류: {e}")
         return pd.DataFrame()
 
 # --- [3. 핵심 함수: 제미나이 가공] ---
 def ai_process(row, margin, fee):
     prompt = f"""
-    너는 온라인 위탁판매 전문가야. 오늘 날짜는 {today_str}이야.
-    [원본상품명] {row['원본상품명']} / [공급원가] {row['공급가']}원
-    미션: 브랜드/상표권 단어는 삭제하고 한국 소비자가 좋아할만한 25자 내외의 상품명을 지어줘.
-    가격은 수수료 {fee*100}%와 마진 {margin*100}%를 계산해서 끝자리가 800/900원인 최적가 숫자로만 제안해.
-    출력 형식: 이름: (가공된이름) / 가격: (숫자만)
+    온라인 쇼핑몰 전문가로서 상품명을 가공해줘.
+    [원본명] {row['원본상품명']} / [원가] {row['공급가']}원 / [날짜] {today_str}
+    미션: 상표권 위험 단어는 빼고, 25자 내외의 세련된 한국어 상품명으로 바꿔줘. 
+    가격은 수수료 {fee*100}%와 마진 {margin*100}%를 고려해 끝자리 900원 단위로 책정해줘.
+    출력 형식: 이름: (이름) / 가격: (숫자)
     """
     try:
         response = model.generate_content(prompt)
         txt = response.text
-        # 이름과 가격 추출 로직 강화
-        name = row['원본상품명']
-        price = int(row['공급가'] * 1.3)
-        
-        if "이름:" in txt:
-            name = txt.split("이름:")[1].split("/")[0].split("\n")[0].strip()
-        if "가격:" in txt:
-            price_raw = re.findall(r'\d+', txt.split("가격:")[1])[0]
-            price = int(price_raw)
-            
-        return name, price
+        name = re.search(r"이름:\s*(.*?)\s*/", txt).group(1).strip() if "이름:" in txt else row['원본상품명']
+        price = re.search(r"가격:\s*([\d,]+)", txt).group(1).replace(",", "") if "가격:" in txt else str(int(row['공급가']*1.3))
+        return name, int(price)
     except:
-        return f"[시즌] {row['원본상품명'][:15]}", int(row['공급가'] * 1.3)
+        return row['원본상품명'], int(row['공급가'] * 1.3)
 
 # --- [4. 메인 화면] ---
 st.title(f"♊ Gemini AI 시즌 소싱 ({today_str})")
@@ -96,31 +90,26 @@ st.sidebar.header("⚙️ 전략 설정")
 target_margin = st.sidebar.slider("순마진율 (%)", 5, 50, 25) / 100
 market_fee = 0.066 
 
-search_keyword = st.text_input("소싱 키워드", value="양말")
+keyword = st.text_input("소싱 키워드 (예: 양말, 슬리퍼, 어버이날)", value="양말")
 
-if st.button(f"🔥 {search_keyword} 10개 수집 및 가공 시작"):
-    with st.spinner("데이터를 분석하고 가공하는 중..."):
-        raw_df = fetch_dome_data(search_keyword, 10)
+if st.button(f"🚀 {keyword} 상품 10개 분석 시작"):
+    with st.spinner("도매매 데이터를 불러오고 있습니다..."):
+        df = fetch_dome_data(keyword, 10)
         
-        if not raw_df.empty:
-            processed_results = []
-            for _, row in raw_df.iterrows():
-                new_name, new_price = ai_process(row, target_margin, market_fee)
-                profit = new_price - row['공급가'] - (new_price * market_fee)
-                processed_results.append({
-                    "가공상품명": new_name,
-                    "AI추천가": f"{new_price:,}원",
-                    "예상순익": f"{int(profit):,}원"
-                })
+        if not df.empty:
+            processed = []
+            for _, row in df.iterrows():
+                n, p = ai_process(row, target_margin, market_fee)
+                profit = p - row['공급가'] - (p * market_fee)
+                processed.append({"가공명": n, "AI가격": f"{p:,}원", "수익": f"{int(profit):,}원"})
             
-            final_df = pd.concat([raw_df, pd.DataFrame(processed_results)], axis=1)
-            st.success("✅ 가공 성공!")
-            st.dataframe(final_df[["상품코드", "원본상품명", "공급가", "가공상품명", "AI추천가", "예상순익"]], use_container_width=True)
+            result = pd.concat([df, pd.DataFrame(processed)], axis=1)
+            st.success("✅ 분석 완료!")
+            st.dataframe(result[["상품코드", "원본상품명", "공급가", "가공명", "AI가격", "수익"]], use_container_width=True)
             
-            st.subheader("🖼️ 상품 썸네일")
             cols = st.columns(5)
-            for i, row in raw_df.iterrows():
+            for i, row in df.iterrows():
                 with cols[i % 5]:
                     if row['이미지']: st.image(row['이미지'], caption=row['상품코드'])
         else:
-            st.error("데이터를 가져오지 못했습니다. 도매매 사이트에서 API 키가 '사용중'인지 확인해 주세요.")
+            st.error("데이터를 가져오지 못했습니다. 검색어를 바꾸거나 도매매 API 키 상태를 확인하세요.")
