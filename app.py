@@ -7,102 +7,122 @@ from datetime import datetime
 import re
 
 # --- [1. 설정 정보] ---
+# 사장님이 새로 발급받은 일반 계정 정보 적용
 GEMINI_API_KEY = "AIzaSyDPwqZCgMvsESnP5kg3C-ZDSIW3tt3xSYU" 
-DOME_KEY = "69e11616807b334323c19d1a80cfd491" 
-# 이미지에서 확인된 사장님 정보
-DOME_ID_FULL = "sns@262783"
-DOME_ID_NUM = "262783"
+DOME_ID = "ryule1122"  # 새 아이디
+DOME_KEY = "7f476022a7670ce1f483b470c6b1aef9" # 새 인증키
 
+# 제미나이 설정
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 today_str = datetime.now().strftime("%Y-%m-%d")
 
 st.set_page_config(page_title="Gemini AI 시즌 소싱 마스터", layout="wide")
 
-# --- [2. 핵심 함수: 도매매 수집 (3단계 인증 시도)] ---
+# --- [2. 핵심 함수: 도매매 수집] ---
 def fetch_dome_data(keyword, limit=10):
-    # 도매매 API 표준 주소 (가장 안정적인 경로)
+    # 일반 계정용 표준 API 주소
     url = "http://openapi.domeggook.com/helper/api/itemList"
     
-    # 시도할 아이디 목록 (연동 계정 특성 고려)
-    id_list = [DOME_ID_FULL, DOME_ID_NUM, "cooking_4u"] # 이메일 앞자리까지 후보군 추가
+    params = {
+        "ver": "2.0",
+        "mode": "getItemList",
+        "aid": DOME_KEY,      
+        "id": DOME_ID,        
+        "market": "dome",     
+        "sw": keyword,    
+        "sz": limit,      
+        "sort": "reg"     
+    }
     
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    
-    for try_id in id_list:
-        params = {
-            "ver": "2.0",
-            "mode": "getItemList",
-            "aid": DOME_KEY,      
-            "id": try_id,        
-            "market": "dome",     
-            "sw": keyword,    
-            "sz": limit,      
-            "sort": "reg"     
-        }
+    try:
+        # 브라우저인 척 접근하기 위한 헤더
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, params=params, headers=headers, timeout=10)
         
+        # 글자 깨짐 방지 (EUC-KR 처리)
         try:
-            res = requests.get(url, params=params, headers=headers, timeout=10)
+            content = res.content.decode('utf-8')
+        except UnicodeDecodeError:
             content = res.content.decode('euc-kr', errors='replace')
-            
-            # 성공적으로 아이템을 가져온 경우 루프 종료
-            if "<item>" in content:
-                root = ET.fromstring(content)
-                items = []
-                for item in root.findall(".//item"):
-                    try:
-                        items.append({
-                            "상품코드": item.find("no").text if item.find("no") is not None else "N/A",
-                            "원본상품명": item.find("title").text if item.find("title") is not None else "이름없음",
-                            "공급가": int(item.find("price").text) if item.find("price") is not None else 0,
-                            "이미지": item.find("img").text if item.find("img") is not None else ""
-                        })
-                    except: continue
-                return pd.DataFrame(items)
+        
+        root = ET.fromstring(content)
+        msg_node = root.find(".//message")
+        
+        # 도매매 서버의 응답 확인
+        if msg_node is not None and msg_node.text != "OK":
+            st.warning(f"도매매 알림: {msg_node.text}")
+            return pd.DataFrame()
+
+        items = []
+        for item in root.findall(".//item"):
+            try:
+                items.append({
+                    "상품코드": item.find("no").text if item.find("no") is not None else "N/A",
+                    "원본상품명": item.find("title").text if item.find("title") is not None else "이름없음",
+                    "공급가": int(item.find("price").text) if item.find("price") is not None else 0,
+                    "이미지": item.find("img").text if item.find("img") is not None else ""
+                })
+            except: continue
                 
-        except Exception:
-            continue
-            
-    return pd.DataFrame()
+        return pd.DataFrame(items)
+    except Exception as e:
+        st.error(f"연결 오류 발생: {e}")
+        return pd.DataFrame()
 
 # --- [3. 핵심 함수: 제미나이 가공] ---
 def ai_process(row, margin, fee):
-    prompt = f"위탁판매 상품명 '{row['원본상품명']}'(원가:{row['공급가']}원)을 {today_str} 시즌에 맞춰 가공해줘. 상표권 제외, 25자 내외. 가격은 마진{margin*100}%와 수수료{fee*100}% 포함, 끝자리 900원. 형식: 이름: (이름) / 가격: (숫자)"
+    # 제미나이에게 보내는 가공 요청
+    prompt = f"""
+    온라인 쇼핑몰 전문가로서 다음 상품을 가공해줘.
+    [원본명] {row['원본상품명']} / [원가] {row['공급가']}원 / [오늘날짜] {today_str}
+    미션: 
+    1. 상표권 위험 단어는 삭제하고, 지금 시즌에 맞는 매력적인 25자 내외 상품명으로 변경.
+    2. 수수료 {fee*100}%와 마진 {margin*100}%를 계산해서 끝자리가 900원인 최적가 산출.
+    양식: 이름: (이름) / 가격: (숫자)
+    """
     try:
         response = model.generate_content(prompt)
         txt = response.text
+        # 결과값에서 이름과 가격만 추출
         name = re.search(r"이름:\s*(.*?)\s*/", txt).group(1).strip() if "이름:" in txt else row['원본상품명']
-        price = re.search(r"가격:\s*([\d,]+)", txt).group(1).replace(",", "") if "가격:" in txt else str(int(row['공급가']*1.4))
-        return name, int(price)
+        price_find = re.findall(r'\d+', txt.split("가격:")[1]) if "가격:" in txt else []
+        price = int(price_find[0]) if price_find else int(row['공급가'] * 1.3)
+        return name, price
     except:
-        return row['원본상품명'], int(row['공급가'] * 1.4)
+        return row['원본상품명'], int(row['공급가'] * 1.3)
 
-# --- [4. 메인 화면] ---
+# --- [4. 메인 화면 구성] ---
 st.title(f"♊ Gemini AI 시즌 소싱 ({today_str})")
 st.sidebar.header("⚙️ 전략 설정")
 target_margin = st.sidebar.slider("순마진율 (%)", 5, 50, 25) / 100
-market_fee = 0.066 
+market_fee = 0.066 # 기본 수수료 6.6%
 
-keyword = st.text_input("소싱 키워드 (예: 양말, 슬리퍼, 캠핑)", value="양말")
+search_keyword = st.text_input("소싱 키워드 (예: 양말, 슬리퍼, 캠핑용품)", value="양말")
 
-if st.button(f"🚀 '{keyword}' 분석 시작"):
-    with st.spinner("도매매 서버와 통신 중..."):
-        df = fetch_dome_data(keyword, 10)
+if st.button(f"🚀 '{search_keyword}' 10개 수집 및 Gemini 가공 시작"):
+    with st.spinner("구글 제미나이가 상품을 분석 중입니다..."):
+        df = fetch_dome_data(search_keyword, 10)
         
         if not df.empty:
-            processed = []
+            processed_data = []
             for _, row in df.iterrows():
-                n, p = ai_process(row, target_margin, market_fee)
-                profit = p - row['공급가'] - (p * market_fee)
-                processed.append({"가공명": n, "AI가격": f"{p:,}원", "수익": f"{int(profit):,}원"})
+                new_name, new_price = ai_process(row, target_margin, market_fee)
+                profit = new_price - row['공급가'] - (new_price * market_fee)
+                processed_data.append({
+                    "가공상품명": new_name,
+                    "AI추천가": f"{new_price:,}원",
+                    "예상순익": f"{int(profit):,}원"
+                })
             
-            result = pd.concat([df, pd.DataFrame(processed)], axis=1)
-            st.success("✅ 연결 및 소싱 성공!")
-            st.dataframe(result[["상품코드", "원본상품명", "공급가", "가공명", "AI가격", "수익"]], use_container_width=True)
+            final_result = pd.concat([df, pd.DataFrame(processed_data)], axis=1)
+            st.success("✅ 성공적으로 가공되었습니다!")
+            st.dataframe(final_result[["상품코드", "원본상품명", "공급가", "가공상품명", "AI추천가", "예상순익"]], use_container_width=True)
             
+            st.subheader("🖼️ 상품 썸네일 미리보기")
             cols = st.columns(5)
             for i, row in df.iterrows():
                 with cols[i % 5]:
                     if row['이미지']: st.image(row['이미지'], caption=row['상품코드'])
         else:
-            st.error("데이터를 가져오지 못했습니다. 도매매 API 승인 상태나 IP 제한을 다시 확인해 주세요.")
+            st.error("데이터를 가져오지 못했습니다. 도매매 API 센터에서 새 키가 '사용중'인지 확인해 주세요.")
