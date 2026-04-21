@@ -1,93 +1,99 @@
 import streamlit as st
 import pandas as pd
 from openai import OpenAI
-import math
+import requests
+import xml.etree.ElementTree as ET
+from datetime import datetime
 
-# --- [1. 기본 설정 및 보안] ---
-# 실제 사용 시 발급받은 API 키를 여기에 입력하세요
-OPENAI_KEY = "sk-..." 
-KIPRIS_KEY = "인증키를_입력하세요"
+# --- [1. 설정 정보] ---
+OPENAI_KEY = "sk-..." # 사장님의 OpenAI 키
+DOME_ID = "사장님_도매매_아이디" # 도매매 ID 입력
+DOME_KEY = "69e11616807b334323c19d1a80cfd491"
 
 client = OpenAI(api_key=OPENAI_KEY)
+today_str = datetime.now().strftime("%Y-%m-%d")
 
-st.set_page_config(page_title="AI 위탁판매 자동화", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="AI 시즌 소싱 마스터", layout="wide")
 
-# --- [2. 핵심 로직 함수] ---
-
-def ai_optimizer(row, margin_rate, fee_rate):
-    """AI가 상품명 가공 및 심리적 최적가 책정"""
-    cost = row['공급가']
-    original_name = row['원본상품명']
-    
-    prompt = f"""
-    너는 한국 이커머스 최적화 전문가야.
-    [데이터] 원본명: {original_name}, 원가: {cost}원, 목표마진: {margin_rate*100}%, 수수료: {fee_rate*100}%
-    
-    [미션]
-    1. 상품명: 브랜드/상표권 단어는 무조건 제거하거나 일반명사로 치환. 클릭을 부르는 키워드를 섞어 25자 내외로 작명.
-    2. 가격: 수수료 {fee_rate*100}%와 마진을 감안해 역산한 뒤, 소비자가 '혜자'라고 느낄 심리적 가격(예: 끝자리 900원, 800원)을 숫자만 제안.
-    
-    [출력형식] 상품명: (이름) / 가격: (숫자)
-    """
-    
+# --- [2. 핵심 함수: 도매매 수집] ---
+def fetch_dome_data(keyword, limit=10):
+    url = "http://openapi.domeggook.com/helper/api/itemList"
+    params = {
+        "ver": "2.0",
+        "mode": "getItemList",
+        "aid": DOME_KEY,
+        "market": "dome",
+        "sw": keyword,
+        "sz": limit,
+        "sort": "pms" # 인기순
+    }
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7
-        )
-        res_text = response.choices[0].message.content
-        new_name = res_text.split("상품명:")[1].split("/")[0].strip()
-        new_price = int(res_text.split("가격:")[1].strip().replace(",", ""))
-        return new_name, new_price
+        res = requests.get(url, params=params)
+        root = ET.fromstring(res.content)
+        items = []
+        for item in root.findall(".//item"):
+            items.append({
+                "상품코드": item.find("no").text,
+                "원본상품명": item.find("title").text,
+                "공급가": int(item.find("price").text),
+                "이미지": item.find("img").text
+            })
+        return pd.DataFrame(items)
     except:
-        # 에러 발생 시 수동 계산 안전장치
-        fallback = (int((cost / (1 - margin_rate - fee_rate)) // 1000) * 1000) + 900
-        return f"[검토필요] {original_name}", fallback
+        return pd.DataFrame()
 
-# --- [3. 모바일용 웹 화면 구성] ---
+# --- [3. 핵심 함수: AI 가공] ---
+def ai_process(row, margin, fee):
+    prompt = f"""
+    오늘 날짜는 {today_str}이야. 온라인 위탁판매 전문가로서 행동해줘.
+    [상품명] {row['원본상품명']} / [원가] {row['공급가']}원
+    1. 상품명: 상표권 위험 단어는 지우고, 4월 말~5월 초 시즌 유입 키워드를 넣어 25자 내로 지어줘.
+    2. 가격: 수수료 {fee*100}%와 마진 {margin*100}%를 감안해 역산한 뒤, 심리적 최적가(끝자리 900원 등)를 정해줘.
+    형식: 이름: (새이름) / 가격: (숫자)
+    """
+    try:
+        res = client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":prompt}])
+        txt = res.choices[0].message.content
+        name = txt.split("이름:")[1].split("/")[0].strip()
+        price = int(txt.split("가격:")[1].strip().replace(",",""))
+        return name, price
+    except:
+        return f"[시즌] {row['원본상품명']}", int(row['공급가'] * 1.3)
 
-st.title("📱 AI 대량 등록 제어센터")
-st.markdown("---")
+# --- [4. 메인 화면] ---
+st.title(f"📅 {today_str} AI 시즌 소싱")
+st.sidebar.header("⚙️ 전략 설정")
+target_margin = st.sidebar.slider("순마진율 (%)", 5, 50, 25) / 100
+market_fee = 0.066 # 6.6% 고정
 
-# 사이드바: 전략 컨트롤러 (폰에서 조절 가능)
-st.sidebar.header("💰 가격 및 수수료 전략")
-st_margin = st.sidebar.slider("목표 순마진 (%)", 5, 50, 25) / 100
-st_fee = st.sidebar.number_input("마켓 수수료 (%)", value=6.6) / 100
+# AI의 시즌 추천 테마
+suggested_theme = "어버이날 카네이션 캠핑용품 나들이" 
+search_keyword = st.text_input("소싱 키워드 (AI 추천: 어버이날, 캠핑, 선글라스)", value="어버이날")
 
-# 메인 화면: 데이터 수집 (샘플 데이터)
-st.subheader("📦 수집된 상품 리스트")
-sample_data = {
-    "상품코드": ["DOM-001", "DOM-002", "DOM-003"],
-    "원본상품명": ["나이키 스타일 런닝화", "아디다스 캠핑용 폴딩체어", "정품 가죽 남성 벨트"],
-    "공급가": [22000, 35000, 11000]
-}
-df = pd.DataFrame(sample_data)
-st.dataframe(df, use_container_width=True)
-
-# 실행 버튼
-if st.button("🚀 AI 지능형 대량 가공 시작", use_container_width=True):
-    if "sk-" not in OPENAI_KEY:
-        st.error("OpenAI API 키를 먼저 설정해주세요!")
-    else:
-        with st.spinner("AI가 수수료를 계산하고 상표권을 피하는 중..."):
-            processed_list = []
-            for _, row in df.iterrows():
-                new_name, new_price = ai_optimizer(row, st_margin, st_fee)
-                
-                # 순수익 계산기
-                real_profit = new_price - row['공급가'] - (new_price * st_fee)
-                
-                processed_list.append({
-                    "가공 상품명": new_name,
-                    "AI 추천가": f"{new_price:,}원",
-                    "예상 순익": f"{int(real_profit):,}원"
+if st.button(f"🚀 {search_keyword} 관련 상품 10개 수집 및 AI 가공"):
+    with st.spinner("도매매에서 상품을 긁어오고 AI가 분석 중..."):
+        raw_df = fetch_dome_data(search_keyword, 10)
+        
+        if not raw_df.empty:
+            processed_results = []
+            for _, row in raw_df.iterrows():
+                new_name, new_price = ai_process(row, target_margin, market_fee)
+                profit = new_price - row['공급가'] - (new_price * market_fee)
+                processed_results.append({
+                    "가공상품명": new_name,
+                    "AI추천가": f"{new_price:,}원",
+                    "예상수익": f"{int(profit):,}원"
                 })
             
-            # 결과 표시
-            res_df = pd.concat([df, pd.DataFrame(processed_list)], axis=1)
-            st.success("✅ 가공이 완료되었습니다!")
-            st.dataframe(res_df, use_container_width=True)
-
-# 하단 정보
-st.caption("작동 순서: 도매처 데이터 로드 ➔ AI 상표권 필터링 ➔ 수수료 기반 가격 책정 ➔ 등록 대기")
+            final_df = pd.concat([raw_df, pd.DataFrame(processed_results)], axis=1)
+            st.success("✅ 시즌 맞춤 가공 완료!")
+            st.dataframe(final_df[["상품코드", "원본상품명", "공급가", "가공상품명", "AI추천가", "예상수익"]], use_container_width=True)
+            
+            # 이미지 보기 기능 추가
+            st.subheader("🖼️ 상품 썸네일 미리보기")
+            cols = st.columns(5)
+            for i, row in raw_df.head(10).iterrows():
+                with cols[i % 5]:
+                    st.image(row['이미지'], caption=row['상품코드'])
+        else:
+            st.error("도매매에서 상품을 가져오지 못했습니다. 키워드나 API키를 확인하세요.")
