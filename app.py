@@ -23,7 +23,7 @@ def fetch_dome_data(keyword, limit=10):
         "ver": "2.0",
         "mode": "getItemList",
         "aid": DOME_KEY,
-        "market": "dome",
+        "market": DOME_ID,  #
         "sw": keyword,    
         "sz": limit,      
         "sort": "reg"     
