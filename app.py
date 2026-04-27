@@ -1,71 +1,67 @@
+import streamlit as st
 import requests
-import xml.etree.ElementTree as ET
 import google.generativeai as genai
 
-# 1. 인증 정보 설정
-DOMAEMAE_CONF = {"id": "sns@262783", "key": "6a35f4068cfa2de71ee4229d89f5999f"}
-KIPRIS_KEY = "LcPZHKFPUbVb=Wz0D4TVEn9zei09FcB3/92w=reAhMU="
-# Gemini 키가 있다면 여기에 넣으세요
-genai.configure(api_key="YOUR_GEMINI_API_KEY")
+# 사이트 설정
+st.set_page_config(page_title="AI 상품 소싱 & 상표권 검증", layout="wide")
+st.title("🚀 AI 자동화 상품 소싱 시스템")
 
+# 설정 정보 (Streamlit Secrets에서 불러오기)
+# 직접 입력하거나 배포 사이트 설정에서 관리 가능합니다.
+DOMAEMAE_ID = st.secrets.get("DOMAEMAE_ID", "sns@262783")
+DOMAEMAE_KEY = st.secrets.get("DOMAEMAE_KEY", "6a35f4068cfa2de71ee4229d89f5999f")
+KIPRIS_KEY = st.secrets.get("KIPRIS_KEY", "LcPZHKFPUbVb=Wz0D4TVEn9zei09FcB3/92w=reAhMU=")
+GEMINI_KEY = st.secrets.get("GEMINI_KEY", "")
+
+# 1. 도매매 검색 함수
 def get_domaemae_items(keyword):
-    """도매매에서 상품 리스트 가져오기"""
     url = "http://openapi.domaemae.com/cgi-bin/domaemall/api/get_item_list.php"
     params = {
-        "userid": DOMAEMAE_CONF["id"],
-        "apikey": DOMAEMAE_CONF["key"],
+        "userid": DOMAEMAE_ID,
+        "apikey": DOMAEMAE_KEY,
         "mode": "getItemList",
         "search_word": keyword,
-        "rows": 5  # 테스트용으로 5개만
+        "rows": 10
     }
-    response = requests.get(url, params=params)
-    # 도매매는 XML 응답이 기본인 경우가 많으므로 파싱이 필요할 수 있습니다.
-    return response.text
+    return requests.get(url, params=params).text
 
-def check_kipris_trademark(word):
-    """키프리스 상표권 조회 (단어 단위)"""
+# 2. 키프리스 검증 함수
+def check_kipris(word):
     url = "http://plus.kipris.or.kr/openapi/rest/TrademarkSearchService/freeSearch"
-    params = {
-        "ServiceKey": KIPRIS_KEY,
-        "trademarkName": word,
-        "resultType": "json"
-    }
+    params = {"ServiceKey": KIPRIS_KEY, "trademarkName": word, "resultType": "json"}
     try:
-        res = requests.get(url, params=params)
-        data = res.json()
-        # 검색 결과가 있으면(등록된 상표가 있으면) True 반환
-        count = data.get('body', {}).get('items', {}).get('totalCount', 0)
+        res = requests.get(url, params=params).json()
+        count = res.get('body', {}).get('items', {}).get('totalCount', 0)
         return int(count) > 0
-    except:
-        return False
+    except: return False
 
-def run_automation():
-    # 1. 도매매 상품 소싱
-    target_keyword = "육아용품" # 원하는 카테고리로 변경 가능
-    print(f"1. 도매매에서 '{target_keyword}' 검색 중...")
-    items_xml = get_domaemae_items(target_keyword)
+# --- 사이드바 및 UI ---
+with st.sidebar:
+    st.header("🔍 검색 설정")
+    target_keyword = st.text_input("소싱할 키워드", value="육아용품")
+    start_btn = st.button("자동화 프로세스 시작")
+
+if start_btn:
+    st.info(f"'{target_keyword}' 상품을 분석 중입니다...")
     
-    # [참고] 여기서는 간단히 로직만 설명합니다. 
-    # 실제로는 items_xml에서 상품명(item_name)을 추출하는 과정이 필요합니다.
-    sample_items = ["하기스 기저귀", "무명의 턱받이", "삼성 베이비케어"] 
-
-    print("\n2. 상표권 검증 및 AI 문구 생성 시작...")
-    for item in sample_items:
-        # 2. 키프리스 상표권 검증
-        is_registered = check_kipris_trademark(item)
-        
-        if is_registered:
-            print(f"⚠️ [{item}] - 상표권 등록 확인됨 (주의 필요)")
+    # [가상 데이터 처리 - 실제 XML 파싱 로직 추가 필요]
+    sample_items = ["하기스 기저귀", "디즈니 물티슈", "일반형 턱받이"] 
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📦 도매매 소싱 리스트")
+        for item in sample_items:
+            is_reg = check_kipris(item)
+            if is_reg:
+                st.error(f"❌ {item} (상표권 주의)")
+            else:
+                st.success(f"✅ {item} (안전)")
+                
+    with col2:
+        st.subheader("📝 AI 홍보 문구")
+        if GEMINI_KEY:
+            # AI 생성 로직 실행
+            st.write("AI가 글을 작성하고 있습니다...")
         else:
-            print(f"✅ [{item}] - 등록 상표 없음 (진행 가능)")
-            
-            # 3. AI로 홍보 문구 생성 (Gemini 키가 있을 때만 작동)
-            # model = genai.GenerativeModel('gemini-pro')
-            # prompt = f"상품명 '{item}'에 대한 네이버 블로그 판매 홍보글을 작성해줘."
-            # response = model.generate_content(prompt)
-            # print(f"📝 AI 생성글: {response.text[:50]}...")
-
-    print("\n전체 공정 완료!")
-
-if __name__ == "__main__":
-    run_automation()
+            st.warning("Gemini API Key를 등록하면 AI 글쓰기가 활성화됩니다.")
