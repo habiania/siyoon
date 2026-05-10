@@ -6,7 +6,7 @@ import requests
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-import openai
+import google.generativeai as genai
 
 # =====================================================
 # 기본 설정
@@ -14,11 +14,12 @@ import openai
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DOMEME_API_KEY = os.getenv("DOMEME_API_KEY")
-DOMEME_SEARCH_URL = os.getenv("DOMEME_SEARCH_URL")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
+DOMEME_API_KEY = os.getenv("DOMEME_API_KEY") or st.secrets.get("DOMEME_API_KEY", "")
+DOMEME_SEARCH_URL = os.getenv("DOMEME_SEARCH_URL") or st.secrets.get("DOMEME_SEARCH_URL", "")
 
-openai.api_key = OPENAI_API_KEY
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 st.set_page_config(
     page_title="월천셀러 AI MD 상품발굴기",
@@ -39,8 +40,7 @@ PLATFORM_RULES = {
 - 네이버 쇼핑 검색형 상품명 중요
 - 생활불편 해결형 상품 선호
 - 리뷰 쌓기 쉬운 저가~중가 상품 유리
-- 상표권, 브랜드명, 과장광고, 의료효능 표현 매우 위험
-- 쿠팡 최저가와 경쟁 안 되는 상품은 감점
+- 상표권, 브랜드명, 과장광고, 의료효능 표현 위험
 - 썸네일 개선으로 클릭률을 올릴 수 있는 상품 가산점
 """
     },
@@ -54,7 +54,6 @@ PLATFORM_RULES = {
 - 직관적인 상품명 중요
 - 생활용품, 계절상품, 차량용품, 잡화류 적합
 - 옵션 복잡한 상품 감점
-- 배송비 포함 판매가가 너무 높으면 감점
 - CS 적고 반복 판매 가능한 상품 가산점
 """
     },
@@ -69,7 +68,6 @@ PLATFORM_RULES = {
 - 설명이 쉬운 상품 유리
 - 저관여 생활불편 해결 상품 적합
 - 고가, 옵션복잡, AS필요 상품 불리
-- 한눈에 필요성이 느껴지는 상품 가산점
 """
     }
 }
@@ -83,35 +81,29 @@ RISKY_WORDS = [
 ]
 
 BAD_CATEGORY_HINTS = [
-    "전자", "가전", "의료", "건강기능", "식품", "화장품", "유아식",
+    "전자", "가전", "의료", "건강기능", "식품", "화장품",
     "배터리", "충전기", "칼", "공구", "유리", "도자기"
 ]
 
 # =====================================================
-# AI 호출
+# Gemini 호출
 # =====================================================
 
 def ask_ai(prompt, temperature=0.3):
-    if not OPENAI_API_KEY:
-        raise ValueError("OPENAI_API_KEY가 없습니다.")
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY가 없습니다.")
 
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": """
-너는 월매출 천만원 이상 온라인 위탁판매 AI MD다.
-스마트스토어, 옥션/지마켓, 토스쇼핑 기준으로 상품성과 리스크를 냉정하게 평가한다.
-좋은 말보다 실제 판매 가능성, 마진, CS, 상표위험, 플랫폼 적합도를 우선 판단한다.
-"""
-            },
-            {"role": "user", "content": prompt}
-        ],
-        temperature=temperature
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
+    response = model.generate_content(
+        prompt,
+        generation_config={
+            "temperature": temperature,
+            "response_mime_type": "application/json"
+        }
     )
 
-    return response["choices"][0]["message"]["content"]
+    return response.text
 
 
 def extract_json(text):
@@ -126,7 +118,7 @@ def extract_json(text):
 
 
 # =====================================================
-# AI 메인 MD: 시장 판단 + 키워드 자동 발굴
+# AI 메인 MD: 시장 판단 + 키워드 발굴
 # =====================================================
 
 def ai_market_and_keywords(today_context, keyword_count=20):
@@ -163,8 +155,11 @@ def ai_market_and_keywords(today_context, keyword_count=20):
 }}
 """
 
-    result = ask_ai(prompt, temperature=0.45)
-    data = extract_json(result)
+    try:
+        result = ask_ai(prompt, temperature=0.45)
+        data = extract_json(result)
+    except Exception:
+        data = None
 
     if not data:
         return {
@@ -432,10 +427,8 @@ def ai_md_evaluate(product, platform):
     try:
         result = ask_ai(prompt, temperature=0.2)
         data = extract_json(result)
-
         if not data:
             raise ValueError("JSON 파싱 실패")
-
     except Exception:
         data = {
             "score": 50,
@@ -448,8 +441,6 @@ def ai_md_evaluate(product, platform):
             "thumbnail_text": ""
         }
 
-    score = int(data.get("score", 0))
-
     return {
         "platform": platform,
         "keyword": product["keyword"],
@@ -461,7 +452,7 @@ def ai_md_evaluate(product, platform):
         "recommend_price": price,
         "margin": margin,
         "margin_rate": margin_rate,
-        "ai_score": score,
+        "ai_score": int(data.get("score", 0)),
         "decision": data.get("decision", "보류"),
         "reason": data.get("reason", ""),
         "platform_title": data.get("platform_title", product["name"]),
@@ -477,7 +468,7 @@ def ai_md_evaluate(product, platform):
 # =====================================================
 
 st.title("월천셀러 AI MD 도매매 상품발굴기")
-st.caption("버튼 한 번으로 AI가 시장 판단 → 키워드 발굴 → 도매매 상품 수집 → 플랫폼별 MD 점수화까지 진행합니다.")
+st.caption("Gemini AI가 시장 판단 → 키워드 발굴 → 도매매 상품 수집 → 플랫폼별 MD 점수화까지 진행합니다.")
 
 with st.sidebar:
     st.header("실행 설정")
@@ -512,16 +503,15 @@ with st.sidebar:
 
 
 if run_btn:
-    if not OPENAI_API_KEY:
-        st.error("OPENAI_API_KEY가 .env 파일에 없습니다.")
+    if not GEMINI_API_KEY:
+        st.error("GEMINI_API_KEY가 없습니다. Streamlit Secrets 또는 .env에 넣어주세요.")
         st.stop()
 
     if not platforms:
         st.error("평가할 플랫폼을 최소 1개 선택하세요.")
         st.stop()
 
-    # 1. AI 시장 판단 + 키워드 발굴
-    with st.spinner("AI 메인 MD가 오늘 시장과 키워드를 판단 중..."):
+    with st.spinner("Gemini AI 메인 MD가 오늘 시장과 키워드를 판단 중..."):
         market_data = ai_market_and_keywords(today_context, keyword_count)
 
         keyword_items = market_data.get("keywords", [])
@@ -559,7 +549,6 @@ if run_btn:
         st.warning("키워드가 없습니다.")
         st.stop()
 
-    # 2. 도매매 상품 수집 + 1차 필터
     all_products = []
     filtered_logs = []
 
@@ -592,7 +581,6 @@ if run_btn:
             st.dataframe(pd.DataFrame(filtered_logs), use_container_width=True)
         st.stop()
 
-    # 3. AI MD 플랫폼별 점수화
     results = []
     total = len(all_products) * len(platforms)
     progress = st.progress(0)
