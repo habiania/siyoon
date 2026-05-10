@@ -14,9 +14,15 @@ import google.generativeai as genai
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
-DOMEME_API_KEY = os.getenv("DOMEME_API_KEY") or st.secrets.get("DOMEME_API_KEY", "")
-DOMEME_SEARCH_URL = os.getenv("DOMEME_SEARCH_URL") or st.secrets.get("DOMEME_SEARCH_URL", "")
+def get_secret(key, default=""):
+    try:
+        return os.getenv(key) or st.secrets.get(key, default)
+    except Exception:
+        return os.getenv(key) or default
+
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
+DOMEME_API_KEY = get_secret("DOMEME_API_KEY")
+DOMEME_SEARCH_URL = get_secret("DOMEME_SEARCH_URL")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -181,8 +187,10 @@ def ai_market_and_keywords(today_context, keyword_count=20):
 # 도매매 상품 검색
 # =====================================================
 
-def search_domeme(keyword, limit=20):
+def search_domeme(keyword, limit=20, debug=False):
     if not DOMEME_API_KEY or not DOMEME_SEARCH_URL:
+        if debug:
+            st.warning("DOMEME_API_KEY 또는 DOMEME_SEARCH_URL이 없어 샘플상품으로 실행됩니다.")
         return sample_products(keyword, limit)
 
     params = {
@@ -195,22 +203,28 @@ def search_domeme(keyword, limit=20):
     try:
         res = requests.get(DOMEME_SEARCH_URL, params=params, timeout=20)
         res.raise_for_status()
-        data = res.json()
 
-        if isinstance(data, dict):
-            items = (
-                data.get("items")
-                or data.get("products")
-                or data.get("data")
-                or data.get("result")
-                or data.get("goods")
-                or data.get("list")
-                or []
-            )
-        elif isinstance(data, list):
-            items = data
-        else:
-            items = []
+        try:
+            data = res.json()
+        except Exception:
+            st.error("도매매 응답이 JSON 형식이 아닙니다.")
+            st.text(res.text[:3000])
+            return []
+
+        if debug:
+            with st.expander(f"도매매 원본 응답 보기: {keyword}", expanded=False):
+                st.write("요청 URL")
+                st.code(res.url)
+                st.write("응답 JSON")
+                st.json(data)
+
+        items = extract_items_from_response(data)
+
+        if debug:
+            st.write(f"'{keyword}' 추출 상품 수: {len(items)}개")
+            if items:
+                with st.expander(f"첫 번째 상품 원본 보기: {keyword}", expanded=False):
+                    st.json(items[0])
 
         return [normalize_product(item, keyword) for item in items[:limit]]
 
@@ -219,62 +233,113 @@ def search_domeme(keyword, limit=20):
         return []
 
 
+def extract_items_from_response(data):
+    if isinstance(data, list):
+        return data
+
+    if not isinstance(data, dict):
+        return []
+
+    candidate_keys = [
+        "items", "products", "data", "result", "goods", "list",
+        "item", "product", "rows", "content", "body"
+    ]
+
+    for key in candidate_keys:
+        value = data.get(key)
+
+        if isinstance(value, list):
+            return value
+
+        if isinstance(value, dict):
+            for inner_key in candidate_keys:
+                inner_value = value.get(inner_key)
+                if isinstance(inner_value, list):
+                    return inner_value
+
+    # 혹시 data 내부 깊은 곳에 list가 있을 때 자동 탐색
+    found = find_first_list(data)
+    return found if found else []
+
+
+def find_first_list(obj):
+    if isinstance(obj, list):
+        return obj
+
+    if isinstance(obj, dict):
+        for value in obj.values():
+            result = find_first_list(value)
+            if isinstance(result, list) and result:
+                return result
+
+    return []
+
+
+def pick_first(item, keys, default=""):
+    for key in keys:
+        value = item.get(key)
+        if value not in [None, "", "null"]:
+            return value
+    return default
+
+
 def normalize_product(item, keyword):
+    if not isinstance(item, dict):
+        item = {}
+
+    product_no = pick_first(item, [
+        "productNo", "goodsNo", "itemNo",
+        "goods_no", "product_no", "item_no",
+        "goodsCode", "goodsCd", "goods_code",
+        "productCode", "productCd", "product_code",
+        "prdNo", "prdCd", "prdCode", "prd_no", "prd_cd",
+        "no", "id", "code", "idx"
+    ])
+
+    name = pick_first(item, [
+        "productName", "goodsName", "itemName",
+        "goods_name", "product_name", "item_name",
+        "goodsNm", "productNm", "prdNm", "prdName",
+        "name", "title"
+    ])
+
+    supply_price = to_int(pick_first(item, [
+        "supplyPrice", "supply_price",
+        "price", "goodsPrice", "goods_price",
+        "salePrice", "sale_price",
+        "sellPrice", "sellingPrice",
+        "consumerPrice", "cost",
+        "prdPrice", "prd_price"
+    ], 0))
+
+    shipping_fee = to_int(pick_first(item, [
+        "shippingFee", "deliveryFee",
+        "delivery_price", "shipping_price",
+        "deliveryPrice", "shipFee",
+        "dlvFee", "dlv_fee"
+    ], 3000))
+
+    category = str(pick_first(item, [
+        "category", "categoryName", "cateName",
+        "category_name", "cate_name",
+        "catename", "cateNm", "categoryNm"
+    ], ""))
+
+    image = str(pick_first(item, [
+        "image", "imageUrl", "thumbnail",
+        "mainImage", "main_image",
+        "imgUrl", "img_url",
+        "goodsImage", "goods_image"
+    ], ""))
+
     return {
         "keyword": keyword,
-        "product_no": str(
-            item.get("productNo")
-            or item.get("goodsNo")
-            or item.get("itemNo")
-            or item.get("goods_no")
-            or item.get("product_no")
-            or item.get("id")
-            or item.get("code")
-            or ""
-        ),
-        "name": str(
-            item.get("productName")
-            or item.get("goodsName")
-            or item.get("itemName")
-            or item.get("goods_name")
-            or item.get("product_name")
-            or item.get("name")
-            or item.get("title")
-            or ""
-        ),
-        "supply_price": to_int(
-            item.get("supplyPrice")
-            or item.get("supply_price")
-            or item.get("price")
-            or item.get("goodsPrice")
-            or item.get("goods_price")
-            or item.get("salePrice")
-            or item.get("cost")
-            or 0
-        ),
-        "shipping_fee": to_int(
-            item.get("shippingFee")
-            or item.get("deliveryFee")
-            or item.get("delivery_price")
-            or item.get("shipping_price")
-            or item.get("deliveryPrice")
-            or 3000
-        ),
-        "category": str(
-            item.get("category")
-            or item.get("categoryName")
-            or item.get("cateName")
-            or item.get("category_name")
-            or ""
-        ),
-        "image": str(
-            item.get("image")
-            or item.get("imageUrl")
-            or item.get("thumbnail")
-            or item.get("mainImage")
-            or item.get("main_image")
-            or ""
-        ),
+        "product_no": str(product_no),
+        "name": str(name),
+        "supply_price": supply_price,
+        "shipping_fee": shipping_fee,
+        "category": category,
+        "image": image,
         "raw": item
     }
 
@@ -499,6 +564,8 @@ with st.sidebar:
         placeholder="예: 차량용선풍기, 냉감패드"
     )
 
+    debug_api = st.checkbox("도매매 원본 응답 보기", value=False)
+
     run_btn = st.button("오늘 팔릴 상품 AI MD가 찾기", type="primary")
 
 
@@ -554,7 +621,7 @@ if run_btn:
 
     with st.spinner("도매매 상품 수집 및 1차 필터링 중..."):
         for keyword in keywords:
-            products = search_domeme(keyword, product_limit)
+            products = search_domeme(keyword, product_limit, debug=debug_api)
 
             for product in products:
                 passed, reason = pre_filter(product)
